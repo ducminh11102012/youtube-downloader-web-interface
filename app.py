@@ -1,4 +1,4 @@
-from flask import Flask, request, send_file, render_template_string, redirect, url_for
+from flask import Flask, request, send_file, render_template_string, redirect, url_for, jsonify
 import yt_dlp, uuid, os, threading
 from datetime import datetime, timedelta
 import time
@@ -7,23 +7,70 @@ app = Flask(__name__)
 DOWNLOAD_DIR = "/downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-FILES = {}  # file_id: {"path":..., "expiry":...}
+COOKIES_FILE = os.path.join(os.getcwd(), "cookies.txt")  # nếu có cookies, để trống nếu không muốn dùng
+
+FILES = {}  # file_id: {"url":..., "path":..., "expiry":..., "progress":0, "error":None}
 
 TEMP_PAGE = """
 <!doctype html>
-<title>Download Temp</title>
-<h2>Choose format for download</h2>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Choose Format</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="p-4">
+<div class="container">
+<h2>Choose format</h2>
 <p>{{url}}</p>
-<a href="/start/{{file_id}}?fmt=mp3"><button>MP3</button></a>
-<a href="/start/{{file_id}}?fmt=mp4"><button>MP4</button></a>
+<a href="/start/{{file_id}}?fmt=mp3" class="btn btn-primary">MP3</a>
+<a href="/start/{{file_id}}?fmt=mp4" class="btn btn-success">MP4</a>
+</div>
+</body>
+</html>
 """
 
-LINK_PAGE = """
+PROGRESS_PAGE = """
 <!doctype html>
-<title>Download Ready</title>
-<h2>Your download is ready</h2>
-<p>Use wget/curl to download (valid 12h):</p>
-<p><a href="{{link}}">{{link}}</a></p>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Downloading</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="p-4">
+<div class="container">
+<h2>Downloading...</h2>
+<div class="progress" style="height:30px;">
+  <div id="bar" class="progress-bar" role="progressbar" style="width:0%">0%</div>
+</div>
+<p id="status">Please wait...</p>
+<div id="link" style="margin-top:15px;"></div>
+</div>
+
+<script>
+let fid = "{{file_id}}";
+function update(){
+  fetch("/progress/"+fid).then(r=>r.json()).then(p=>{
+    let bar = document.getElementById("bar");
+    if(p.error){
+      document.getElementById("status").innerText = "Error: "+p.error;
+      return;
+    }
+    bar.style.width = p.percent+"%";
+    bar.innerText = p.percent+"%";
+    if(p.done){
+      document.getElementById("status").innerText="Download complete!";
+      document.getElementById("link").innerHTML='<a href="/file/'+fid+'" class="btn btn-primary">Download File</a>';
+    } else {
+      setTimeout(update, 1000);
+    }
+  });
+}
+update();
+</script>
+</body>
+</html>
 """
 
 @app.route("/", methods=["GET","POST"])
@@ -31,38 +78,68 @@ def index():
     if request.method=="POST":
         url = request.form.get("url")
         file_id = str(uuid.uuid4())
-        # Save temp info
-        FILES[file_id] = {"url":url, "path":None, "expiry":None}
+        FILES[file_id] = {"url":url,"path":None,"expiry":None,"progress":0,"error":None}
         return redirect(url_for("dl_temp", file_id=file_id))
     return """
     <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="UTF-8">
     <title>YouTube Downloader</title>
-    <h2>Enter YouTube URL</h2>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    </head>
+    <body class="p-4">
+    <div class="container">
+    <h2>YouTube Downloader</h2>
     <form method="POST">
-      URL: <input name="url" required>
-      <button type="submit">Next</button>
+      <div class="mb-3">
+        <label class="form-label">YouTube URL:</label>
+        <input class="form-control" name="url" required>
+      </div>
+      <button class="btn btn-primary" type="submit">Next</button>
     </form>
+    </div>
+    </body>
+    </html>
     """
 
 @app.route("/dl-temp/<file_id>")
 def dl_temp(file_id):
     if file_id not in FILES: return "Invalid or expired", 404
-    url = FILES[file_id]["url"]
-    return render_template_string(TEMP_PAGE, file_id=file_id, url=url)
+    return render_template_string(TEMP_PAGE, file_id=file_id, url=FILES[file_id]["url"])
 
 def download_thread(url, fmt, file_id):
     ext = fmt
     out_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.{ext}")
-    ydl_opts = {"outtmpl":out_path}
+    FILES[file_id]["progress"] = 0
+    FILES[file_id]["error"] = None
+
+    def progress_hook(d):
+        if d.get("status")=="downloading":
+            pct = d.get("_percent_str","0.0%").replace("%","")
+            try: FILES[file_id]["progress"] = float(pct)
+            except: pass
+        elif d.get("status")=="finished":
+            FILES[file_id]["progress"] = 100
+
+    ydl_opts = {"outtmpl":out_path,"progress_hooks":[progress_hook]}
+    if os.path.exists(COOKIES_FILE):
+        ydl_opts["cookies"] = COOKIES_FILE
+
     if fmt=="mp3":
         ydl_opts["format"]="bestaudio"
         ydl_opts["postprocessors"]=[{"key":"FFmpegExtractAudio","preferredcodec":"mp3"}]
     else:
         ydl_opts["format"]="bestvideo+bestaudio"
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-    FILES[file_id]["path"] = out_path
-    FILES[file_id]["expiry"] = datetime.utcnow() + timedelta(hours=12)
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        FILES[file_id]["path"] = out_path
+        FILES[file_id]["expiry"] = datetime.utcnow() + timedelta(hours=12)
+    except Exception as e:
+        FILES[file_id]["progress"] = -1
+        FILES[file_id]["error"] = str(e)
 
 @app.route("/start/<file_id>")
 def start_download(file_id):
@@ -71,20 +148,16 @@ def start_download(file_id):
     if fmt not in ["mp3","mp4"]: return "Invalid format", 400
     url = FILES[file_id]["url"]
     threading.Thread(target=download_thread, args=(url, fmt, file_id)).start()
-    return f"""
-    <!doctype html>
-    <title>Downloading...</title>
-    <h2>Downloading in background...</h2>
-    <p>Refresh <a href="/link/{file_id}">here</a> to get your link once done.</p>
-    """
+    return render_template_string(PROGRESS_PAGE, file_id=file_id)
 
-@app.route("/link/<file_id>")
-def get_link(file_id):
-    if file_id not in FILES: return "Invalid or expired", 404
+@app.route("/progress/<file_id>")
+def get_progress(file_id):
+    if file_id not in FILES: return jsonify({"percent":0,"done":False})
     info = FILES[file_id]
-    if not info["path"]: return "Still downloading...", 200
-    direct_link = f"/file/{file_id}"
-    return render_template_string(LINK_PAGE, link=direct_link)
+    if info["progress"] < 0:
+        return jsonify({"percent":0,"done":False,"error":info["error"]})
+    done = info["progress"]>=100 and info["path"] is not None
+    return jsonify({"percent":int(info["progress"]),"done":done})
 
 @app.route("/file/<file_id>")
 def download_file(file_id):
